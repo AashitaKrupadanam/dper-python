@@ -1,0 +1,5 @@
+*.pkl
+*.mp4
+__pycache__/
+*.pyc
+school_configs/
