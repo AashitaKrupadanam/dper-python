@@ -3,19 +3,43 @@ from scipy.integrate import solve_ivp
 import matplotlib.pyplot as plt # type: ignore[import]
 from matplotlib.path import Path  # type: ignore[import]
 from matplotlib import colors
+from numba import njit
 
 import imageio
 from io import BytesIO
 from PIL import Image
 import gc
 
+@njit(cache=True, fastmath=True)
+def _vortex_induced_velocity_kernel(target_x, target_y, vortex_x, vortex_y, gamma, delta):
+    n_targets = target_x.size
+    n_vortices = vortex_x.size
+    u_x = np.zeros(n_targets)
+    u_y = np.zeros(n_targets)
+    delta2 = delta * delta
+    for i in range(n_targets):
+        tx = target_x[i]
+        ty = target_y[i]
+        ux_sum = 0.0
+        uy_sum = 0.0
+        for j in range(n_vortices):
+            dx = tx - vortex_x[j]
+            dy = ty - vortex_y[j]
+            norm2 = dx*dx + dy*dy + delta2
+            strength = gamma[j] / (2 * np.pi)
+            ux_sum += -strength * dy / norm2
+            uy_sum +=  strength * dx / norm2
+        u_x[i] = ux_sum
+        u_y[i] = uy_sum
+    return u_x, u_y
+
 class Environment:
 
-    def __init__(self, fishies, controller=True, time_N=8001):
+    def __init__(self, fishies, controller=True):
 
         # Integration parameters
         self.time_step = 0
-        self.time_N = time_N
+        self.time_N = 8001
         self.t_max = 40
         self.delta_T = self.t_max/(self.time_N - 1)
 
@@ -67,108 +91,169 @@ class Environment:
         self.output_bvs = []
         self.output_bvs_gamma = []
 
-    def fvs_flow_velocity(self, z, delta=0.2):
 
-        # Extract x and y positions from targets
+    def fvs_flow_velocity(self, z, delta=0.2):
+ 
         x = z[0, :]
         y = z[1, :]
-
-        # Initialzie velocity contributions
         u_x = np.zeros_like(x)
         u_y = np.zeros_like(y)
-
+    
         for ii in range(self.fish_N):
-            
-            # Extract current FVS positions
             fvs_positions = self.fvs_positions[ii]
-
-            # Extract x and y positions from free vortices
+            if fvs_positions.shape[1] == 0:
+                continue
             v_x = fvs_positions[0, :]
             v_y = fvs_positions[1, :]
-
-            # Compute pairwise distances
-            dx = x[np.newaxis, :] - v_x[:, np.newaxis]
-            dy = y[np.newaxis, :] - v_y[:, np.newaxis]
-            norm2 = dx**2 + dy**2 + delta**2
-
-            # Strength of each vortex
-            strength = self.fvs_Gamma[ii] / (2 * np.pi)
-            strength_array = strength[:, np.newaxis]
-
-            # Accumulate velocity contributions
-            u_x += np.sum(-strength_array * dy / norm2, axis=0)
-            u_y += np.sum( strength_array * dx / norm2, axis=0)
-
-        return np.vstack((u_x, u_y))
+            gamma = self.fvs_Gamma[ii]
+            ux_i, uy_i = _vortex_induced_velocity_kernel(x, y, v_x, v_y, gamma, delta)
+            u_x += ux_i
+            u_y += uy_i
     
-    def bvs_flow_velocity(self, z, delta=0.01):
+        return np.vstack((u_x, u_y))
+ 
+    # def fvs_flow_velocity(self, z, delta=0.2):
 
-        # Extract x and y positions from targets
+    #     # Extract x and y positions from targets
+    #     x = z[0, :]
+    #     y = z[1, :]
+
+    #     # Initialzie velocity contributions
+    #     u_x = np.zeros_like(x)
+    #     u_y = np.zeros_like(y)
+
+    #     for ii in range(self.fish_N):
+            
+    #         # Extract current FVS positions
+    #         fvs_positions = self.fvs_positions[ii]
+
+    #         # Extract x and y positions from free vortices
+    #         v_x = fvs_positions[0, :]
+    #         v_y = fvs_positions[1, :]
+
+    #         # Compute pairwise distances
+    #         dx = x[np.newaxis, :] - v_x[:, np.newaxis]
+    #         dy = y[np.newaxis, :] - v_y[:, np.newaxis]
+    #         norm2 = dx**2 + dy**2 + delta**2
+
+    #         # Strength of each vortex
+    #         strength = self.fvs_Gamma[ii] / (2 * np.pi)
+    #         strength_array = strength[:, np.newaxis]
+
+    #         # Accumulate velocity contributions
+    #         u_x += np.sum(-strength_array * dy / norm2, axis=0)
+    #         u_y += np.sum( strength_array * dx / norm2, axis=0)
+
+    #     return np.vstack((u_x, u_y))
+    
+
+    def bvs_flow_velocity(self, z, delta=0.01):
+ 
         x = z[0, :]
         y = z[1, :]
         n_targets = x.size
-
-        # Initialize velocity vectors
         u_x = np.zeros(n_targets)
         u_y = np.zeros(n_targets)
-
-        # Loop over all fish
+    
         for fish in self.fishies:
-
-            # Extract x and y positions from bound vortices
             v_x = fish.bvs_positions[0, :]
             v_y = fish.bvs_positions[1, :]
-
-            # Compute pairwise distances
-            dx = x - v_x[:, np.newaxis]
-            dy = y - v_y[:, np.newaxis]
-            norm2 = dx**2 + dy**2 + delta**2
-
-            # Strength of each vortex
             strength = (fish.bvs_gamma * fish.bvs_length) / (2 * np.pi)
-            strength_array = strength[:, np.newaxis]
-
-            # Accumulate velocity contributions
-            u_x += np.sum(-strength_array * dy / norm2, axis=0)
-            u_y += np.sum( strength_array * dx / norm2, axis=0)
-
+ 
+            gamma_equivalent = strength * (2 * np.pi)
+            ux_i, uy_i = _vortex_induced_velocity_kernel(x, y, v_x, v_y, gamma_equivalent, delta)
+            u_x += ux_i
+            u_y += uy_i
+    
         return np.vstack((u_x, u_y))
+    # def bvs_flow_velocity(self, z, delta=0.01):
+
+    #     # Extract x and y positions from targets
+    #     x = z[0, :]
+    #     y = z[1, :]
+    #     n_targets = x.size
+
+    #     # Initialize velocity vectors
+    #     u_x = np.zeros(n_targets)
+    #     u_y = np.zeros(n_targets)
+
+    #     # Loop over all fish
+    #     for fish in self.fishies:
+
+    #         # Extract x and y positions from bound vortices
+    #         v_x = fish.bvs_positions[0, :]
+    #         v_y = fish.bvs_positions[1, :]
+
+    #         # Compute pairwise distances
+    #         dx = x - v_x[:, np.newaxis]
+    #         dy = y - v_y[:, np.newaxis]
+    #         norm2 = dx**2 + dy**2 + delta**2
+
+    #         # Strength of each vortex
+    #         strength = (fish.bvs_gamma * fish.bvs_length) / (2 * np.pi)
+    #         strength_array = strength[:, np.newaxis]
+
+    #         # Accumulate velocity contributions
+    #         u_x += np.sum(-strength_array * dy / norm2, axis=0)
+    #         u_y += np.sum( strength_array * dx / norm2, axis=0)
+
+    #     return np.vstack((u_x, u_y))
 
     def bvs_exclude_current(self, z, current_fish, delta=0.01):
-
-        # Extract x and y positions from targets
+ 
         x = z[0, :]
         y = z[1, :]
         n_targets = x.size
-
-        # Initialize velocity vectors
         u_x = np.zeros(n_targets)
         u_y = np.zeros(n_targets)
-
-        # Loop over all fish
+    
         for fish in self.fishies:
-
             if fish == current_fish:
                 continue
-
-            # Extract x and y positions from bound vortices
             v_x = fish.bvs_positions[0, :]
             v_y = fish.bvs_positions[1, :]
-
-            # Compute pairwise distances
-            dx = x - v_x[:, np.newaxis]
-            dy = y - v_y[:, np.newaxis]
-            norm2 = dx**2 + dy**2 + delta**2
-
-            # Strength of each vortex
             strength = (fish.bvs_gamma * fish.bvs_length) / (2 * np.pi)
-            strength_array = strength[:, np.newaxis]
-
-            # Accumulate velocity contributions
-            u_x += np.sum(-strength_array * dy / norm2, axis=0)
-            u_y += np.sum( strength_array * dx / norm2, axis=0)
-
+            gamma_equivalent = strength * (2 * np.pi)
+            ux_i, uy_i = _vortex_induced_velocity_kernel(x, y, v_x, v_y, gamma_equivalent, delta)
+            u_x += ux_i
+            u_y += uy_i
+    
         return np.vstack((u_x, u_y))
+    # def bvs_exclude_current(self, z, current_fish, delta=0.01):
+
+    #     # Extract x and y positions from targets
+    #     x = z[0, :]
+    #     y = z[1, :]
+    #     n_targets = x.size
+
+    #     # Initialize velocity vectors
+    #     u_x = np.zeros(n_targets)
+    #     u_y = np.zeros(n_targets)
+
+    #     # Loop over all fish
+    #     for fish in self.fishies:
+
+    #         if fish == current_fish:
+    #             continue
+
+    #         # Extract x and y positions from bound vortices
+    #         v_x = fish.bvs_positions[0, :]
+    #         v_y = fish.bvs_positions[1, :]
+
+    #         # Compute pairwise distances
+    #         dx = x - v_x[:, np.newaxis]
+    #         dy = y - v_y[:, np.newaxis]
+    #         norm2 = dx**2 + dy**2 + delta**2
+
+    #         # Strength of each vortex
+    #         strength = (fish.bvs_gamma * fish.bvs_length) / (2 * np.pi)
+    #         strength_array = strength[:, np.newaxis]
+
+    #         # Accumulate velocity contributions
+    #         u_x += np.sum(-strength_array * dy / norm2, axis=0)
+    #         u_y += np.sum( strength_array * dx / norm2, axis=0)
+
+    #     return np.vstack((u_x, u_y))
     
     def external_flow_velocity(self, z):
 
@@ -535,11 +620,11 @@ class Environment:
             ax.grid(True)
             # ax.legend()
             plt.pause(0.1)
-
+'''
     def save_animation(self, video_filename, output=None, output_Gamma=None, output_bvs=None, output_bvs_gamma=None, show_bvs=False):
 
         # Video parameters
-        num_frames = len(output)
+        #num_frames = len(output)
         fps = 25
 
         # Use passed-in data if given, otherwise fallback to self attributes
@@ -547,6 +632,8 @@ class Environment:
         output_Gamma = output_Gamma if output_Gamma is not None else self.output_Gamma
         output_bvs = output_bvs if output_bvs is not None else self.output_bvs
         output_bvs_gamma = output_bvs_gamma if output_bvs_gamma is not None else self.output_bvs_gamma
+
+        num_frames = len(output)
 
         # Preset vortex color maps
         all_Gamma = np.concatenate(output_Gamma)
@@ -567,7 +654,7 @@ class Environment:
             plt.grid(True, color='gray', linestyle=':', linewidth=0.5, zorder=0)
             
             # Plot fishies at each time
-            for ii in range(0, 5001, 8): # full speed  # 4): # half speed self.time_N
+            for ii in range(0, len(output), 8): # full speed  # 4): # half speed self.time_N
 
                 # Clear image and update state at each time step
                 ax.clear()
@@ -655,3 +742,114 @@ class Environment:
 
                 # Print to update progress
                 print(f"Generated frame {ii + 1}/{num_frames}")
+'''
+
+def save_animation(self, video_filename, output=None, output_Gamma=None, output_bvs=None, output_bvs_gamma=None, show_bvs=False, dpi=150):
+
+    fps = 25
+
+    output = output if output is not None else self.output
+    output_Gamma = output_Gamma if output_Gamma is not None else self.output_Gamma
+    output_bvs = output_bvs if output_bvs is not None else self.output_bvs
+    output_bvs_gamma = output_bvs_gamma if output_bvs_gamma is not None else self.output_bvs_gamma
+
+    num_frames = len(output)
+
+    all_Gamma = np.concatenate(output_Gamma)
+    if all_Gamma.size == 0:
+        vmin = -1
+        vmax = 1
+    else:
+        vmin = np.min(all_Gamma)
+        vmax = np.max(all_Gamma)
+    norm = colors.TwoSlopeNorm(vmin=vmin, vcenter=0.0, vmax=vmax)
+    cmap = plt.get_cmap('seismic')
+
+    try:
+        with imageio.get_writer(video_filename, fps=fps) as writer:
+
+            fig, ax = plt.subplots(figsize=(16, 9), dpi=dpi)
+            plt.grid(True, color='gray', linestyle=':', linewidth=0.5, zorder=0)
+
+            frame_indices = list(range(0, len(output), 8))
+            total_frames_to_write = len(frame_indices)
+
+            for frame_num, ii in enumerate(frame_indices):
+
+                ax.clear()
+                current_state = output[ii]
+                current_Gamma = output_Gamma[ii]
+                current_bvs = output_bvs[ii]
+                current_bvs_gamma = output_bvs_gamma[ii]
+
+                start = 0
+                for fish in self.fishies:
+
+                    end = start + 2*fish.N
+                    positions = current_state[start:end].reshape((2,fish.N), order='F')
+
+                    midpoints = (positions[:,0:fish.N-1] + positions[:,1:fish.N])/2
+                    edges = positions[:,1:fish.N] - positions[:,0:fish.N-1]
+                    tangents = edges/np.linalg.norm(edges, axis=0)
+                    normals = np.vstack([-tangents[1,:], tangents[0,:]])
+
+                    southwestPoints = midpoints - 0.5*tangents*fish.l_edge_ref.T - 0.5*normals*fish.h_edge_ref.T
+                    northwestPoints = midpoints - 0.5*tangents*fish.l_edge_ref.T + 0.5*normals*fish.h_edge_ref.T
+                    northeastPoints = midpoints + 0.5*tangents*fish.l_edge_ref.T + 0.5*normals*fish.h_edge_ref.T
+                    southeastPoints = midpoints + 0.5*tangents*fish.l_edge_ref.T - 0.5*normals*fish.h_edge_ref.T
+
+                    for jj in range(fish.N-1):
+                        rectangleX = [southwestPoints[0, jj], northwestPoints[0, jj],
+                                    northeastPoints[0, jj], southeastPoints[0, jj]]
+                        rectangleY = [southwestPoints[1, jj], northwestPoints[1, jj],
+                                    northeastPoints[1, jj], southeastPoints[1, jj]]
+                        ax.fill(rectangleX, rectangleY, 'k', zorder=2)
+
+                    start = end + 2*fish.N
+
+                    if self.control:
+                        true_direction = positions[:, 0] - positions[:, 2]
+                        quiver_true = true_direction / np.linalg.norm(true_direction)
+                        quiver_desired = fish.fish_length * fish.desired_heading_vector
+                        plt.quiver(positions[0, 0], positions[1, 0], quiver_true[0], quiver_true[1],
+                                angles='xy', scale_units='xy', scale=1, width=0.001, headwidth=6, headlength=8, color='red')
+                        plt.quiver(positions[0, 0], positions[1, 0], quiver_desired[0], quiver_desired[1],
+                                angles='xy', scale_units='xy', scale=1, width=0.001, headwidth=6, headlength=8, color='blue')
+
+                vortex_data = current_state[start:]
+                num_vortices = vortex_data.size // 2
+                free_vortices = vortex_data.reshape((2,num_vortices), order='F')
+                ax.scatter(free_vortices[0,:], free_vortices[1,:], c=current_Gamma,
+                    cmap=cmap, norm=norm, s=10, zorder=1)
+
+                if show_bvs:
+                    ax.scatter(current_bvs[0,:], current_bvs[1,:], c=current_bvs_gamma,
+                        cmap=cmap, norm=norm, s=10)
+
+                plt.xlim(-28.0,10.0)
+                plt.ylim(-4.0,6.0)
+                ax.set_aspect('equal')
+                ax.grid(True)
+
+                buf = BytesIO()
+                fig.savefig(buf, format='png')
+                buf.seek(0)
+                image = Image.open(buf)
+                frame_array = np.array(image)
+                writer.append_data(frame_array)
+                image.close()
+                buf.close()
+                del image, frame_array, buf
+
+                if frame_num % 5 == 0:
+                    gc.collect()
+
+                print(f"Generated frame {frame_num + 1}/{total_frames_to_write}")
+
+            plt.close(fig)
+
+    except Exception as e:
+        import traceback
+        print(f"save_animation failed at frame {frame_num if 'frame_num' in dir() else '?'}")
+        traceback.print_exc()
+        raise

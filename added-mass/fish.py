@@ -32,6 +32,20 @@ class Fish:
         self.past_offset = 0
         self.heading_intergral = np.deg2rad(config['initial_heading'])
 
+        '''
+        new
+        '''
+        if 'goal_points' in config:
+            self.goal_points = [np.array(p, dtype=float) for p in config['goal_points']]
+        elif 'goal_x' in config and 'goal_y' in config:
+            self.goal_points = [np.array([config['goal_x'], config['goal_y']])]
+        else:
+            self.goal_points = None
+
+        self.goal_index = 0
+        self.arrival_radius = config.get('arrival_radius', 0.5)  # distance to count as "reached"
+        self.navigation_done = False
+
         # Wave propagation parameters
         self.wave_number = config['normalized_wave_number'] / self.fish_length
         self.wave_frequency = config['wave_frequency']
@@ -246,6 +260,12 @@ class Fish:
         self.heading[self.time_step] = current_heading
         self.heading_intergral += (current_heading - self.desired_heading) * self.delta_T
 
+        '''
+        new
+        '''
+       
+        self.update_navigation(tip_head)
+
         # Prior for one full tail beat
         if self.time_step < self.period_steps - 1:
 
@@ -280,6 +300,35 @@ class Fish:
         # Return phase offset control input
         self.control_inputs[self.time_step] = offset
         return offset
+    
+    def update_navigation(self, tip_head):
+        if self.goal_points is None:
+            return False
+
+        if self.navigation_done:
+            # Hold last computed heading rather than recomputing a noisy
+            # bearing to a point we're sitting on top of
+            return True
+
+        current_goal = self.goal_points[self.goal_index]
+        to_goal = current_goal - tip_head
+        dist = np.linalg.norm(to_goal)
+
+        # Advance through intermediate waypoints
+        while dist < self.arrival_radius and self.goal_index < len(self.goal_points) - 1:
+            self.goal_index += 1
+            current_goal = self.goal_points[self.goal_index]
+            to_goal = current_goal - tip_head
+            dist = np.linalg.norm(to_goal)
+
+        # Reached the final waypoint: freeze heading, stop updating
+        if dist < self.arrival_radius and self.goal_index == len(self.goal_points) - 1:
+            self.navigation_done = True
+            return True
+
+        self.desired_heading = np.mod(np.arctan2(to_goal[1], to_goal[0]), 2 * np.pi)
+        self.desired_heading_vector = np.array([np.cos(self.desired_heading), np.sin(self.desired_heading)])
+        return True
 
     def internal_forces(self, time, z0, u):
 
